@@ -2,13 +2,15 @@
 from __future__ import absolute_import
 import os
 import octoprint.plugin
-import yagmail
 import flask
 import tempfile
-from email.utils import formatdate
+import email, smtplib, ssl
 
-from email.utils import formatdate
-from flask.ext.login import current_user
+from email import encoders
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from flask_login import current_user
 
 class EmailNotifierPlugin(octoprint.plugin.EventHandlerPlugin,
                           octoprint.plugin.SettingsPlugin,
@@ -36,6 +38,7 @@ class EmailNotifierPlugin(octoprint.plugin.EventHandlerPlugin,
 			mail_tls=False,
 			mail_ssl=False,
 			mail_username="",
+			mail_password="",
 			mail_useralias="",
 			include_snapshot=True,
 			message_format=dict(
@@ -51,7 +54,7 @@ class EmailNotifierPlugin(octoprint.plugin.EventHandlerPlugin,
 		data = octoprint.plugin.SettingsPlugin.on_settings_load(self)
 
 		# only return our restricted settings to admin users - this is only needed for OctoPrint <= 1.2.16
-		restricted = ("mail_server", "mail_port", "mail_tls", "mail_ssl","mail_username", "recipient_address", "mail_useralias")
+		restricted = ("mail_server", "mail_port", "mail_tls", "mail_ssl","mail_username", "mail_password", "recipient_address", "mail_useralias")
 		for r in restricted:
 			if r in data and (current_user is None or current_user.is_anonymous() or not current_user.is_admin()):
 				data[r] = None
@@ -60,7 +63,7 @@ class EmailNotifierPlugin(octoprint.plugin.EventHandlerPlugin,
 
 	def get_settings_restricted_paths(self):
 		# only used in OctoPrint versions > 1.2.16
-		return dict(admin=[["mail_server"], ["mail_port"], ["mail_tls"], ["mail_ssl"], ["mail_username"], ["recipient_address"], ["mail_useralias"]])
+		return dict(admin=[["mail_server"], ["mail_port"], ["mail_tls"], ["mail_ssl"], ["mail_username"], ["mail_password"], ["recipient_address"], ["mail_useralias"]])
 
 	#~~ TemplatePlugin
 
@@ -78,16 +81,13 @@ class EmailNotifierPlugin(octoprint.plugin.EventHandlerPlugin,
 		if not self._settings.get(['enabled']):
 			return
 		
-		filename = os.path.basename(payload["file"])
-		
 		import datetime
 		import octoprint.util
 		elapsed_time = octoprint.util.get_formatted_timedelta(datetime.timedelta(seconds=payload["time"]))
 		
-		tags = {'filename': filename, 'elapsed_time': elapsed_time}
+		tags = {'filename': payload["name"], 'elapsed_time': elapsed_time}
 		subject = self._settings.get(["message_format", "title"]).format(**tags)
-		message = self._settings.get(["message_format", "body"]).format(**tags)
-		body = [message]
+		body = self._settings.get(["message_format", "body"]).format(**tags)
 		
 		try:
 			self.send_notification(subject, body, self._settings.get(['include_snapshot']))
@@ -107,12 +107,12 @@ class EmailNotifierPlugin(octoprint.plugin.EventHandlerPlugin,
 
 				# version check: github repository
 				type="github_release",
-				user="anoved",
+				user="adrcunha",
 				repo="OctoPrint-EmailNotifier",
 				current=self._plugin_version,
 
 				# update method: pip
-				pip="https://github.com/anoved/OctoPrint-EmailNotifier/archive/{target_version}.zip",
+				pip="https://github.com/adrcunha/OctoPrint-EmailNotifier/archive/{target_version}.zip",
 				dependency_links=False
 			)
 		)
@@ -128,7 +128,7 @@ class EmailNotifierPlugin(octoprint.plugin.EventHandlerPlugin,
 		if command == "testmail":
 
 			subject = "OctoPrint Email Notifier Test"
-			body = ["If you received this email, your email notification configuration in OctoPrint is working as expected."]
+			body = "If you received this email, your email notification configuration in OctoPrint is working as expected."
 			snapshot = bool(data["snapshot"])
 
 			try:
@@ -145,31 +145,56 @@ class EmailNotifierPlugin(octoprint.plugin.EventHandlerPlugin,
 		else:
 			return flask.make_response("Unknown command", 400)
 
+	def connect_smtp(self, context, use_ssl, use_tls):
+		server = self._settings.get(['mail_server'])
+		port = self._settings.get(['mail_server_port'])
+		if use_ssl:
+			return smtplib.SMTP_SSL(server, port, context=context)
+		elif use_tls:
+			return smtplib.SMTP(server, port)
+		return None
 
 	# Helper function to reduce code duplication.
 	# If snapshot == True, a webcam snapshot will be appended to body before sending.
-	def send_notification(self, subject="OctoPrint notification", body=[""], snapshot=True):
+	def send_notification(self, subject="OctoPrint notification", body="", snapshot=True):
+
+		message = MIMEMultipart()
+		message["From"] = self._settings.get(['mail_useralias'])
+		message["To"] = self._settings.get(['recipient_address'])
+		message["Subject"] = subject
+		message.attach(MIMEText(body, "plain"))
 
 		# If a snapshot is requested, let's grab it now.
 		if snapshot:
 			snapshot_url = self._settings.global_get(["webcam", "snapshot"])
 			if snapshot_url:
 				try:
-					import urllib
-					filename, headers = urllib.urlretrieve(snapshot_url, tempfile.gettempdir()+"/snapshot.jpg")
+					part = MIMEBase("application", "octet-stream")
+					import urllib.request
+					with urllib.request.urlopen(snapshot_url) as f:
+						part.set_payload(f.read())
+					encoders.encode_base64(part)
+					part.add_header("Content-Disposition", "attachment; filename=snapshot.jpg")
+					message.attach(part)
 				except Exception as e:
 					self._logger.exception("Snapshot error (sending email notification without image): %s" % (str(e)))
-				else:
-					body.append(yagmail.inline(filename))
 
 		# Exceptions thrown by any of the following lines are intentionally not
 		# caught. The callers need to be able to handle them in different ways.
-		mailer = yagmail.SMTP(user={self._settings.get(['mail_username']):self._settings.get(['mail_useralias'])}, host=self._settings.get(['mail_server']),port=self._settings.get(['mail_server_port']), smtp_starttls=self._settings.get(['mail_server_tls']), smtp_ssl=self._settings.get(['mail_server_ssl']))
-		emails = [email.strip() for email in self._settings.get(['recipient_address']).split(',')]
-		mailer.send(to=emails, subject=subject, contents=body, headers={"Date": formatdate()})
+		context = ssl.create_default_context()
+		use_ssl = bool(self._settings.get(['mail_server_ssl']))
+		use_tls = bool(self._settings.get(['mail_server_tls']))
+		with self.connect_smtp(context, use_ssl, use_tls) as server:
+			if use_tls:
+				server.ehlo()
+				server.starttls(context=context)
+				server.ehlo()
+			server.login(self._settings.get(['mail_username']), self._settings.get(['mail_password']))
+			server.sendmail(message["From"], message["To"], message.as_string())
 
 
 __plugin_name__ = "Email Notifier"
+__plugin_pythoncompat__ = ">=2.7,<4"
 
 def __plugin_load__():
 	global __plugin_implementation__
