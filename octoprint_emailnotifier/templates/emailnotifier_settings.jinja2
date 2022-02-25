@@ -17,6 +17,13 @@
 		</div>
 	</div>
 	
+	<div class="control-group" title="{{ _('Wait this many seconds before sending an e-mail notification.') }}">
+		<label class="control-label">{{ _('Wait before sending the e-mail (seconds)') }}</label>
+		<div class="controls">
+			<input type="text" class="input-block-level" data-bind="value: settings.plugins.emailnotifier.wait_time">
+		</div>
+	</div>
+
 	<h4>{{ _('SMTP Settings') }}</h4>
 	
 	<div class="control-group" title="{{ _('SMTP server.') }}">

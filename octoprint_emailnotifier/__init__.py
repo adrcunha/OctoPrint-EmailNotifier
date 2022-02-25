@@ -5,6 +5,7 @@ import octoprint.plugin
 import flask
 import tempfile
 import email, smtplib, ssl
+import datetime
 
 from email import encoders
 from email.mime.base import MIMEBase
@@ -28,11 +29,10 @@ class EmailNotifierPlugin(octoprint.plugin.EventHandlerPlugin,
 	#~~ SettingsPlugin
 
 	def get_settings_defaults(self):
-		# matching password must be registered in system keyring
-		# to support customizable mail server, may need port too
 		return dict(
 			enabled=False,
 			recipient_address="",
+			wait_time=120,
 			mail_server="",
 			mail_port="",
 			mail_tls=False,
@@ -54,7 +54,7 @@ class EmailNotifierPlugin(octoprint.plugin.EventHandlerPlugin,
 		data = octoprint.plugin.SettingsPlugin.on_settings_load(self)
 
 		# only return our restricted settings to admin users - this is only needed for OctoPrint <= 1.2.16
-		restricted = ("mail_server", "mail_port", "mail_tls", "mail_ssl","mail_username", "mail_password", "recipient_address", "mail_useralias")
+		restricted = ("mail_server", "mail_port", "mail_tls", "mail_ssl","mail_username", "mail_password", "recipient_address", "mail_useralias", "wait_time")
 		for r in restricted:
 			if r in data and (current_user is None or current_user.is_anonymous() or not current_user.is_admin()):
 				data[r] = None
@@ -63,7 +63,7 @@ class EmailNotifierPlugin(octoprint.plugin.EventHandlerPlugin,
 
 	def get_settings_restricted_paths(self):
 		# only used in OctoPrint versions > 1.2.16
-		return dict(admin=[["mail_server"], ["mail_port"], ["mail_tls"], ["mail_ssl"], ["mail_username"], ["mail_password"], ["recipient_address"], ["mail_useralias"]])
+		return dict(admin=[["mail_server"], ["mail_port"], ["mail_tls"], ["mail_ssl"], ["mail_username"], ["mail_password"], ["recipient_address"], ["mail_useralias"], ["wait_time"]])
 
 	#~~ TemplatePlugin
 
@@ -78,19 +78,27 @@ class EmailNotifierPlugin(octoprint.plugin.EventHandlerPlugin,
 		if event != "PrintDone":
 			return
 		
+		self._logger.info("Printing done, sending e-mail is %sabled" % ("en" if self._settings.get(['enabled']) else "dis"))
 		if not self._settings.get(['enabled']):
 			return
-		
-		import datetime
-		import octoprint.util
-		elapsed_time = octoprint.util.get_formatted_timedelta(datetime.timedelta(seconds=payload["time"]))
-		
-		tags = {'filename': payload["name"], 'elapsed_time': elapsed_time}
-		subject = self._settings.get(["message_format", "title"]).format(**tags)
-		body = self._settings.get(["message_format", "body"]).format(**tags)
-		
+
+		n = int(self._settings.get(['wait_time']) or 0)
+		self._logger.info("Will send e-mail notification in %d seconds" % n)
+		if not n:
+			self.send_notification(payload)
+		else:
+			octoprint.util.ResettableTimer(n, self.send_notification, args=[payload]).start()
+
+
+	def send_notification(self, payload):
 		try:
-			self.send_notification(subject, body, self._settings.get(['include_snapshot']))
+			elapsed_time = octoprint.util.get_formatted_timedelta(datetime.timedelta(seconds=payload["time"]))
+		
+			tags = {'filename': payload["name"], 'elapsed_time': elapsed_time}
+			subject = self._settings.get(["message_format", "title"]).format(**tags)
+			body = self._settings.get(["message_format", "body"]).format(**tags)
+		
+			self.send_mail(subject, body, self._settings.get(['include_snapshot']))
 		except Exception as e:
 			# If the email wasn't sent, report problems appropriately.
 			self._logger.exception("Email notification error: %s" % (str(e)))
@@ -132,7 +140,8 @@ class EmailNotifierPlugin(octoprint.plugin.EventHandlerPlugin,
 			snapshot = bool(data["snapshot"])
 
 			try:
-				self.send_notification(subject, body, snapshot)
+				# self.send_notification(subject, body, snapshot)
+				self.on_event(event="PrintDone", payload={"time": 0, "name": "FakePrint.gcode"})
 			except Exception as e:
 				self._logger.exception("Email notification error: %s" % (str(e)))
 				return flask.jsonify(success=False, msg=str(e))
@@ -156,7 +165,7 @@ class EmailNotifierPlugin(octoprint.plugin.EventHandlerPlugin,
 
 	# Helper function to reduce code duplication.
 	# If snapshot == True, a webcam snapshot will be appended to body before sending.
-	def send_notification(self, subject="OctoPrint notification", body="", snapshot=True):
+	def send_mail(self, subject="OctoPrint notification", body="", snapshot=True):
 
 		message = MIMEMultipart()
 		message["From"] = self._settings.get(['mail_useralias'])
